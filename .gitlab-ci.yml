@@ -1,0 +1,99 @@
+variables:
+  RULES_CHANGES_PATH: "*/"
+  FRONTEND_PATH: "./sushi-torr"
+  BACKEND_PATH: "./Backend"
+
+stages:
+  - build
+  - test
+  - deploy
+
+.base-rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - $RULES_CHANGES_PATH
+    - when: always
+      allow_failure: true
+
+.backend:
+  extends: .base-rules
+  variables:
+    BACKEND_RULES_CHANGES_PATH: "./Backend/*/"
+
+.frontend:
+  extends: .base-rules
+  variables:
+    FRONTEND_RULES_CHANGES_PATH: "./sushi-torr/*/"
+
+backend-build:
+  image: maven:3.8.3-openjdk-17
+  stage: build
+  extends: .backend
+  script:
+    - cd Backend
+    - echo "Building app..."
+    - mvn clean install
+    - echo "Finished building the app."
+  artifacts:
+    paths:
+      - $BACKEND_PATH/target/*.jar
+
+frontend-build:
+  image: node:latest
+  stage: build
+  extends: .frontend
+  script:
+    - echo "Building frontend"
+    - cd sushi-torr
+    - npm install --force
+    - npm run build
+
+  artifacts:
+    paths:
+      - $FRONTEND_PATH
+
+backend-test:
+  stage: test
+  extends: .backend
+  needs: ["backend-build"]
+  script:
+    - echo "Testing backend"
+  artifacts:
+    paths:
+      - $BACKEND_PATH/target/*.jar
+
+backend-deploy:
+  stage: deploy
+  image: alpine:3.11
+  extends: .backend
+  needs: ["backend-test"]
+  before_script:
+    - apk update && apk add openssh-client bash
+    - mkdir -p ~/.ssh
+    - eval $(ssh-agent -s)
+    - echo "$UBUNTU_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - touch ~/.ssh/config
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - ssh-keyscan -H $UBUNTU_DEPLOY_SERVER_BA_IP >> ~/.ssh/known_hosts
+    - echo "nohup java -jar /home/ubuntu/SUSHI-TOR-0.0.1-SNAPSHOT.jar > output.log 2>&1 &" > start-app.sh
+    - chmod +x start-app.sh
+    - scp start-app.sh ubuntu@$UBUNTU_DEPLOY_SERVER_BA_IP:/home/ubuntu/
+  script:
+    - echo "Deploying..."
+    - scp $BACKEND_PATH/target/*.jar ubuntu@$UBUNTU_DEPLOY_SERVER_BA_IP:/home/ubuntu/
+    - ssh ubuntu@$UBUNTU_DEPLOY_SERVER_BA_IP 'pkill java|| echo "No hay proceso java corriendo"'
+    - ssh ubuntu@$UBUNTU_DEPLOY_SERVER_BA_IP '/home/ubuntu/start-app.sh'
+
+frontend_deploy:
+  stage: deploy
+  needs: [frontend-build]
+  image: python:latest
+  script:
+    - pip install awscli
+    - aws configure set aws_secret_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws s3 sync "sushi-torr" s3://$S3_BUCKET/
+  rules:
+    - changes:
+        - $FRONTEND_PATH/**/*
